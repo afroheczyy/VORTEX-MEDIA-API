@@ -5,3 +5,5 @@ downloads/*
 *.mp3
 *.mp4
 .DS_Store
+cookies.txt
+*.cookies.txt

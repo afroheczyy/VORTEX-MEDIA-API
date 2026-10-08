@@ -1070,6 +1070,109 @@ app.get(
    404
 ========================= */
 
+/* =========================
+   GENERIC SITE DOWNLOAD
+========================= */
+
+const SITE_HOSTS = ["facebook.com", "fb.com", "fb.watch", "instagram.com", "twitter.com", "x.com", "soundcloud.com", "pinterest.com", "pin.it", "tiktok.com"];
+const PIN_RE = /(^|\.)pinterest\.[a-z.]+$/;
+const MIME = { mp4: "video/mp4", webm: "video/webm", mkv: "video/x-matroska", mp3: "audio/mpeg", m4a: "audio/mp4", jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp" };
+
+function siteAllowed(value) {
+    try {
+        const h = new URL(value).hostname.toLowerCase().replace(/^www\./, "");
+        return SITE_HOSTS.some(d => h === d || h.endsWith("." + d)) || PIN_RE.test(h);
+    } catch {
+        return false;
+    }
+}
+
+async function pinterestImage(url, prefix) {
+    const page = await fetch(url, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(15000) });
+    const host = new URL(page.url).hostname.toLowerCase();
+    if (!PIN_RE.test(host)) throw new Error("Not a Pinterest page");
+    const html = await page.text();
+    const m = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i);
+    if (!m) throw new Error("No image found");
+    const img = m[1].replace(/&amp;/g, "&");
+    if (!new URL(img).hostname.endsWith("pinimg.com")) throw new Error("Unexpected image host");
+    for (const c of [img.replace(/\/(\d+x|originals)\//, "/originals/"), img]) {
+        const r = await fetch(c, { signal: AbortSignal.timeout(20000) });
+        if (!r.ok) continue;
+        const buf = Buffer.from(await r.arrayBuffer());
+        if (buf.length > 25 * 1024 * 1024) throw new Error("Image too large");
+        const ext = /png/i.test(r.headers.get("content-type") || "") ? "png" : "jpg";
+        const file = path.join(DOWNLOAD_DIR, `${prefix}.${ext}`);
+        fs.writeFileSync(file, buf);
+        return file;
+    }
+    throw new Error("Image download failed");
+}
+
+app.get("/api/dl", async (req, res) => {
+    if (!acquireDownloadSlot(res)) return;
+
+    const prefix = `dl-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+    try {
+        const url = String(req.query.url || "").trim();
+        const type = String(req.query.type || "auto").toLowerCase();
+
+        if (!url || url.length > 500 || !isValidUrl(url)) {
+            return res.status(400).json({ success: false, error: "Invalid URL" });
+        }
+        if (!siteAllowed(url)) {
+            return res.status(400).json({ success: false, error: "This site is not supported" });
+        }
+
+        console.log(`⬇️ DL (${type}):`, url);
+
+        const opts = {
+            noWarnings: true,
+            noPlaylist: true,
+            maxFilesize: "95M",
+            output: path.join(DOWNLOAD_DIR, `${prefix}.%(ext)s`)
+        };
+        if (process.env.SITE_COOKIES && fs.existsSync(process.env.SITE_COOKIES)) {
+            opts.cookies = process.env.SITE_COOKIES;
+        }
+        if (type === "audio") {
+            Object.assign(opts, { extractAudio: true, audioFormat: "mp3", audioQuality: "0" });
+        } else {
+            Object.assign(opts, { format: "bv*[height<=720]+ba/b[height<=720]/b", mergeOutputFormat: "mp4" });
+        }
+
+        const isPin = /pinterest|pin\.it/i.test(url);
+        try {
+            await youtubedl(url, opts);
+        } catch (e) {
+            if (!isPin) throw e;
+        }
+
+        const found = fs.readdirSync(DOWNLOAD_DIR)
+            .filter(f => f.startsWith(prefix + ".") && !/\.(part|ytdl|tmp)$/i.test(f))
+            .map(f => path.join(DOWNLOAD_DIR, f))
+            .sort((a, b) => fs.statSync(b).size - fs.statSync(a).size);
+
+        let file = found[0];
+        if (!file && isPin) file = await pinterestImage(url, prefix);
+        if (!file) throw new Error("Nothing was downloaded");
+
+        const ext = path.extname(file).slice(1).toLowerCase();
+        console.log("✔ DL READY:", file);
+        sendFileAndCleanup(res, file, `vortex-media.${ext}`, MIME[ext] || "application/octet-stream", prefix);
+
+    } catch (error) {
+        console.error("DL ERROR:", String(error.message).split("\n")[0].slice(0, 200));
+        cleanupPrefix(prefix);
+        if (!res.headersSent) {
+            res.status(500).json({ success: false, error: "Download failed. The post may be private, removed, or the site changed." });
+        }
+    } finally {
+        releaseDownloadSlot();
+    }
+});
+
 app.use(
     (req, res) => {
         res.status(404).json({
